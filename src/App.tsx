@@ -13,10 +13,13 @@ import {
   Sun,
   Trash2,
   X,
+  Activity,
 } from "lucide-react";
 import { Composer } from "./components/Composer";
 import { Message } from "./components/Message";
 import { ModelSwitcher } from "./components/ModelSwitcher";
+import { Diagnostics } from "./components/Diagnostics";
+import { record } from "./lib/diag";
 import { streamChat, fetchModels, ApiError } from "./lib/api";
 import {
   loadActiveId,
@@ -73,6 +76,7 @@ export default function App() {
   const [theme, setTheme] = useState<"light" | "dark">("light");
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [query, setQuery] = useState("");
+  const [diagOpen, setDiagOpen] = useState(false);
 
   const abortRef = useRef<AbortController | null>(null);
   const threadRef = useRef<HTMLDivElement>(null);
@@ -275,6 +279,7 @@ export default function App() {
       const history = [...active.messages, userMsg];
       const model = active.model || catalog?.defaultModel || "openai-fast";
 
+      record("info", "send", { model, chars: trimmed.length, turns: history.length });
       stickToBottom.current = true;
       patchConversation(active.id, (c) => ({
         ...c,
@@ -365,7 +370,7 @@ export default function App() {
   }, [conversations, query]);
 
   const currentModelName =
-    catalog?.models.find((m) => m.id === active?.model)?.name ??
+    catalog?.models?.find((m) => m.id === active?.model)?.name ??
     active?.model ??
     "AI";
 
@@ -468,6 +473,14 @@ export default function App() {
             {theme === "light" ? <Moon size={15} /> : <Sun size={15} />}
             {theme === "light" ? "Dark mode" : "Light mode"}
             <span className="side-link__kbd">⇧⌘O</span>
+          </button>
+          <button
+            type="button"
+            className="side-link"
+            onClick={() => setDiagOpen(true)}
+          >
+            <Activity size={15} />
+            Diagnostics
           </button>
           <a
             className="side-link"
@@ -575,6 +588,8 @@ export default function App() {
           disabled={!active}
         />
       </main>
+
+      <Diagnostics open={diagOpen} onClose={() => setDiagOpen(false)} />
     </div>
   );
 }

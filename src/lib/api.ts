@@ -1,4 +1,5 @@
 import type { ChatMessage, ModelCatalog } from "../types";
+import { record } from "./diag";
 
 export class ApiError extends Error {
   status: number;
@@ -24,8 +25,9 @@ const DIRECT_MODELS = "https://text.pollinations.ai/models";
 /** Pollinations wants a real referring site; a GitHub URL is safest. */
 const REFERRER = "https://github.com/PythonEaterBoi/open-source-chatbot-v2";
 
-/** Best-effort report to the server so failures are visible in its logs. */
+/** Records locally for the Diagnostics panel, and best-effort on the server. */
 function diagnose(stage: string, detail: Record<string, unknown>) {
+  record("warn", stage, detail);
   try {
     void fetch("/api/log", {
       method: "POST",
@@ -57,7 +59,35 @@ export async function fetchModels(): Promise<ModelCatalog> {
     if (direct) return direct;
     throw new ApiError("Could not load the model list", 0);
   }
-  return (await res.json()) as ModelCatalog;
+  return validateCatalog(await res.json());
+}
+
+/**
+ * The model payload comes from a third party, so never trust its shape —
+ * a missing `models` array used to white-screen the whole app.
+ */
+function validateCatalog(raw: unknown): ModelCatalog {
+  const data = raw as Partial<ModelCatalog> | null;
+  if (!data || !Array.isArray(data.models)) {
+    throw new ApiError("The model list was not in the expected format", 0);
+  }
+  const models = data.models
+    .filter((m) => m && typeof m.id === "string")
+    .map((m) => ({
+      ...m,
+      name: typeof m.name === "string" && m.name ? m.name : m.id,
+      vendor: typeof m.vendor === "string" ? m.vendor : "Pollinations",
+      blurb: typeof m.blurb === "string" ? m.blurb : "",
+      tier: m.tier === "free" ? ("free" as const) : ("key" as const),
+      tags: Array.isArray(m.tags) ? m.tags : [],
+      available: m.available !== false,
+      listed: m.listed !== false,
+    }));
+  return {
+    models,
+    source: data.source === "live" ? "live" : "fallback",
+    defaultModel: typeof data.defaultModel === "string" ? data.defaultModel : "openai-fast",
+  };
 }
 
 async function fetchDirectModels(): Promise<ModelCatalog | null> {
