@@ -50,6 +50,10 @@ if the server has no route to Pollinations (locked-down / sandboxed network):
 browser ──────────────────── POST text.pollinations.ai/openai ──────────▶ Pollinations
 ```
 
+The direct path degrades through three request shapes — a JSON POST, a
+"simple" `text/plain` POST (which skips the CORS preflight), and finally the
+GET endpoint — so one of them gets through on most networks.
+
 Both paths use the same keyless endpoint. The proxy is preferred because it
 normalizes the stream, retries on `429`, and keeps the request shape consistent;
 the direct path exists so the app still works when the host has no egress. Since
@@ -77,6 +81,8 @@ file (`server/index.mjs`).
 | `GET`  | `/api/models` | Live model list merged with the curated catalog     |
 | `GET`  | `/api/health` | Liveness + the upstream URL in use                   |
 | `POST` | `/api/chat`   | Streams a completion (`{ model, messages, stream }`) |
+| `POST` | `/api/log`    | Browser-side failure reports (visible in server logs) |
+| `GET`  | `/api/diag`   | Last 50 client reports, newest first                 |
 
 ### Configuration
 

@@ -223,6 +223,25 @@ app.get("/api/models", async (_req, res) => {
   res.json(payload);
 });
 
+const diagLog = [];
+
+/**
+ * The browser reports what it saw when a request fails. This is the only way
+ * to observe failures that happen outside the server process (CORS, a user's
+ * content blocker, a direct-to-Pollinations rejection).
+ */
+app.post("/api/log", (req, res) => {
+  const entry = { at: new Date().toISOString(), ip: req.ip, ...(req.body ?? {}) };
+  diagLog.push(entry);
+  if (diagLog.length > 100) diagLog.shift();
+  console.warn(`[client-diag] ${JSON.stringify(entry)}`);
+  res.status(204).end();
+});
+
+app.get("/api/diag", (_req, res) => {
+  res.json(diagLog.slice(-50).reverse());
+});
+
 app.get("/api/health", (_req, res) => {
   res.json({ ok: true, upstream: POLLINATIONS_BASE });
 });
@@ -254,7 +273,7 @@ app.post("/api/chat", async (req, res) => {
     model: typeof model === "string" && model ? model : DEFAULT_MODEL,
     messages: clean,
     stream: Boolean(stream),
-    referrer: "open-source-chatbot-v2",
+    referrer: "https://github.com/PythonEaterBoi/open-source-chatbot-v2",
   };
   if (typeof temperature === "number") {
     upstreamBody.temperature = Math.min(2, Math.max(0, temperature));
@@ -299,6 +318,11 @@ app.post("/api/chat", async (req, res) => {
   }
 
   if (!upstream) {
+    const cause =
+      lastErr?.cause?.code ?? lastErr?.cause?.message ?? lastErr?.name ?? "unknown";
+    console.warn(
+      `[upstream] could not reach ${POLLINATIONS_BASE}: ${lastErr?.message} (cause=${cause})`,
+    );
     // The server itself has no route to Pollinations (common on locked-down
     // or sandboxed networks). Tell the client to retry from the browser,
     // which may well have internet access.

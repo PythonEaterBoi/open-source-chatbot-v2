@@ -21,7 +21,31 @@ export class ApiError extends Error {
  */
 const DIRECT_URL = "https://text.pollinations.ai/openai";
 const DIRECT_MODELS = "https://text.pollinations.ai/models";
-const REFERRER = "open-source-chatbot-v2";
+/** Pollinations wants a real referring site; a GitHub URL is safest. */
+const REFERRER = "https://github.com/PythonEaterBoi/open-source-chatbot-v2";
+
+/** Best-effort report to the server so failures are visible in its logs. */
+function diagnose(stage: string, detail: Record<string, unknown>) {
+  try {
+    void fetch("/api/log", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ stage, ...detail }),
+      keepalive: true,
+    }).catch(() => {});
+  } catch {
+    /* never let logging break the chat */
+  }
+}
+
+/** Turn a thrown fetch error into something a user can act on. */
+function describeNetworkError(err: unknown): string {
+  const msg = (err as Error)?.message ?? "";
+  if (/failed to fetch|networkerror|load failed/i.test(msg)) {
+    return "The browser could not reach Pollinations. A content blocker, DNS filter, VPN, or offline connection is the usual cause.";
+  }
+  return msg || "Network error";
+}
 
 export async function fetchModels(): Promise<ModelCatalog> {
   let res: Response;
@@ -78,9 +102,15 @@ export async function streamChat(args: StreamArgs): Promise<void> {
     await streamViaProxy(args);
   } catch (err) {
     if (err instanceof ApiError && err.code === "upstream_unreachable") {
+      diagnose("proxy_unreachable", { model: args.model });
       await streamDirect(args);
       return;
     }
+    diagnose("proxy_error", {
+      model: args.model,
+      status: err instanceof ApiError ? err.status : 0,
+      message: (err as Error)?.message,
+    });
     throw err;
   }
 }
@@ -127,40 +157,167 @@ async function streamDirect({
   onDelta,
   onReasoning,
 }: StreamArgs) {
-  let res: Response;
-  try {
-    res = await fetch(DIRECT_URL, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
+  // Order matters: try the richest request first, then degrade to shapes a
+  // browser cannot refuse. A JSON POST triggers a CORS preflight; a "simple"
+  // request (text/plain body) does not, so it survives endpoints that don't
+  // answer OPTIONS properly.
+  const attempts: DirectAttempt[] = [
+    {
+      label: "json-post",
+      url: DIRECT_URL,
+      init: {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model,
+          messages,
+          stream: true,
+          referrer: REFERRER,
+          ...(typeof temperature === "number" ? { temperature } : {}),
+        }),
+      },
+    },
+    {
+      label: "text-post",
+      url: DIRECT_URL,
+      init: {
+        method: "POST",
+        headers: { "content-type": "text/plain;charset=UTF-8" },
+        body: JSON.stringify({ model, messages, stream: true, referrer: REFERRER }),
+      },
+    },
+    {
+      label: "plain-get",
+      url: `${DIRECT_URL.replace(/\/openai$/, "")}/${encodeURIComponent(
+        buildTranscript(messages),
+      )}?model=${encodeURIComponent(model)}&referrer=${encodeURIComponent(REFERRER)}`,
+      init: { method: "GET" },
+    },
+  ];
+
+  let lastError: ApiError | null = null;
+  const networkFailures: string[] = [];
+
+  for (const attempt of attempts) {
+    if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+    let res: Response;
+    try {
+      res = await fetch(attempt.url, { ...attempt.init, signal });
+    } catch (err) {
+      if ((err as Error)?.name === "AbortError") throw err;
+      networkFailures.push(`${attempt.label}: ${(err as Error)?.message}`);
+      diagnose("direct_fetch_failed", {
         model,
-        messages,
-        stream: true,
-        referrer: REFERRER,
-        ...(typeof temperature === "number" ? { temperature } : {}),
-      }),
-      signal,
-    });
-  } catch {
-    throw new ApiError(
-      "Can't reach Pollinations from this browser either. Check your internet connection or any content blocker.",
-      0,
-    );
+        attempt: attempt.label,
+        message: (err as Error)?.message,
+      });
+      continue;
+    }
+
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      diagnose("direct_http_error", {
+        model,
+        attempt: attempt.label,
+        status: res.status,
+        body: body.slice(0, 300),
+      });
+
+      // 401/402 are policy answers, not transport failures: stop here and
+      // explain, because no other shape of the same request will succeed.
+      if (res.status === 401 || res.status === 402) {
+        throw new ApiError(
+          "This model needs a Pollinations API key or Pollen credits. Switch to the free GPT-OSS 20B model in the model menu.",
+          res.status,
+        );
+      }
+      if (res.status === 429) {
+        throw new ApiError(
+          "Pollinations is rate limiting this IP (the free tier allows about one request every 30 seconds). Wait a moment and try again.",
+          429,
+        );
+      }
+      lastError = new ApiError(`Pollinations returned HTTP ${res.status}.`, res.status);
+      continue;
+    }
+
+    if (!res.body) {
+      lastError = new ApiError("The response had no body", 0);
+      continue;
+    }
+
+    const contentType = res.headers.get("content-type") ?? "";
+    const isStream = contentType.includes("event-stream");
+
+    if (isStream) {
+      await pump(res.body, { onDelta, onReasoning });
+    } else if (contentType.includes("application/json")) {
+      const json = (await res.json()) as DirectJson;
+      const text = json?.choices?.[0]?.message?.content ?? json?.text ?? "";
+      if (!text) throw new ApiError("The model returned an empty response.", 0);
+      onDelta(text);
+    } else {
+      // The GET endpoint answers with `data: {json}` frames (or plain text).
+      const raw = await res.text();
+      const parsed = readSseOrText(raw);
+      if (!parsed) throw new ApiError("Unreadable response from Pollinations.", 0);
+      onDelta(parsed);
+    }
+    return;
   }
 
-  if (!res.ok) {
-    throw new ApiError(
-      res.status === 429
-        ? "Pollinations is rate limiting this IP (free tier allows about one request every 30 seconds). Wait a moment and try again."
-        : res.status === 402 || res.status === 401
-          ? "This model needs a Pollinations API key or Pollen credits. Switch to the free GPT-OSS 20B model."
-          : `Pollinations returned HTTP ${res.status}.`,
-      res.status,
-    );
-  }
+  const explain = describeNetworkError(networkFailures[0] ?? "");
+  diagnose("direct_all_failed", { model, networkFailures });
+  throw new ApiError(
+    lastError?.message ??
+      `${explain} Tried ${attempts.length} request shapes without success.`,
+    lastError?.status ?? 0,
+  );
+}
 
-  if (!res.body) throw new ApiError("The response had no body", 0);
-  await pump(res.body, { onDelta, onReasoning });
+interface DirectAttempt {
+  label: string;
+  url: string;
+  init: RequestInit;
+}
+
+interface DirectJson {
+  choices?: { message?: { content?: string } }[];
+  text?: string;
+}
+
+/** Flattens history into a single prompt for the GET endpoint. */
+function buildTranscript(messages: Pick<ChatMessage, "role" | "content">[]): string {
+  return messages
+    .map((m) =>
+      m.role === "assistant" ? `Assistant: ${m.content}` : m.content,
+    )
+    .join("\n\n");
+}
+
+/** Pulls the answer out of `data: {...}` SSE frames or a plain-text body. */
+function readSseOrText(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed) return "";
+
+  if (!trimmed.startsWith("data:")) return trimmed;
+
+  let out = "";
+  for (const line of trimmed.split("\n")) {
+    const l = line.trim();
+    if (!l.startsWith("data:")) continue;
+    const payload = l.slice(5).trim();
+    if (!payload || payload === "[DONE]") continue;
+    try {
+      const json = JSON.parse(payload) as DirectJson & {
+        choices?: { delta?: { content?: string } }[];
+      };
+      out += json?.choices?.[0]?.delta?.content ?? json?.choices?.[0]?.message?.content ?? json?.text ?? "";
+    } catch {
+      out += payload;
+    }
+  }
+  return out || trimmed;
 }
 
 /** Parses our normalized SSE frames, or a raw OpenAI stream from Pollinations. */
